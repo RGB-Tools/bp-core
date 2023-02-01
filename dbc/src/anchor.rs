@@ -30,7 +30,10 @@ use commit_verify::{
     CommitEncode, CommitVerify, ConsensusCommit, PrehashedProtocol, TaggedHash,
 };
 #[cfg(feature = "wallet")]
-use commit_verify::{EmbedCommitProof, EmbedCommitVerify, TryCommitVerify};
+use commit_verify::{
+    EmbedCommitProof, EmbedCommitProofStatic, EmbedCommitVerify,
+    EmbedCommitVerifyStatic, TryCommitVerify, TryCommitVerifyStatic,
+};
 #[cfg(feature = "wallet")]
 use psbt::Psbt;
 use strict_encoding::StrictEncode;
@@ -199,6 +202,19 @@ impl Anchor<lnpbp4::MerkleBlock> {
             dbc_proof: anchor.dbc_proof,
         })
     }
+
+    /// Static entropy version of the commit method
+    #[cfg(feature = "wallet")]
+    pub fn commit_static(
+        psbt: &mut Psbt,
+    ) -> Result<Anchor<lnpbp4::MerkleBlock>, Error> {
+        let anchor = psbt.embed_commit_static(&PsbtEmbeddedMessage)?;
+        Ok(Anchor {
+            txid: anchor.txid,
+            lnpbp4_proof: lnpbp4::MerkleBlock::from(anchor.lnpbp4_proof),
+            dbc_proof: anchor.dbc_proof,
+        })
+    }
 }
 
 impl Anchor<lnpbp4::MerkleProof> {
@@ -348,6 +364,32 @@ impl EmbedCommitProof<PsbtEmbeddedMessage, Psbt, Lnpbp6>
 }
 
 #[cfg(feature = "wallet")]
+impl EmbedCommitProofStatic<PsbtEmbeddedMessage, Psbt, Lnpbp6>
+    for Anchor<lnpbp4::MerkleTree>
+{
+    fn restore_original_container(
+        &self,
+        psbt: &Psbt,
+    ) -> Result<Psbt, PsbtVerifyError> {
+        match self.dbc_proof {
+            Proof::OpretFirst => Ok(psbt.clone()),
+            Proof::TapretFirst(ref proof) => {
+                let mut psbt = psbt.clone();
+                for output in &mut psbt.outputs {
+                    if output.is_tapret_host() {
+                        *output = EmbedCommitProof::<_, psbt::Output, Lnpbp6>::restore_original_container(proof, output)?;
+                        return Ok(psbt);
+                    }
+                }
+                Err(PsbtVerifyError::Commit(
+                    PsbtCommitError::CommitmentImpossible,
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "wallet")]
 impl EmbedCommitVerify<PsbtEmbeddedMessage, Lnpbp6> for Psbt {
     type Proof = Anchor<lnpbp4::MerkleTree>;
     type CommitError = PsbtCommitError;
@@ -387,6 +429,59 @@ impl EmbedCommitVerify<PsbtEmbeddedMessage, Lnpbp6> for Psbt {
             output.script = Script::new_op_return(commitment.as_slice()).into();
             output.set_opret_commitment(commitment.into_array())?;
             output.set_lnpbp4_entropy(tree.entropy())?;
+            (Proof::OpretFirst, tree)
+        } else {
+            return Err(PsbtCommitError::CommitmentImpossible);
+        };
+
+        Ok(Anchor {
+            txid: self.to_txid(),
+            lnpbp4_proof,
+            dbc_proof,
+        })
+    }
+}
+
+#[cfg(feature = "wallet")]
+impl EmbedCommitVerifyStatic<PsbtEmbeddedMessage, Lnpbp6> for Psbt {
+    type Proof = Anchor<lnpbp4::MerkleTree>;
+    type CommitError = PsbtCommitError;
+    type VerifyError = PsbtVerifyError;
+
+    fn embed_commit_static(
+        &mut self,
+        _: &PsbtEmbeddedMessage,
+    ) -> Result<Self::Proof, Self::CommitError> {
+        let lnpbp4_tree =
+            |output: &mut psbt::Output| -> Result<_, PsbtCommitError> {
+                let messages = output.lnpbp4_message_map()?;
+                let min_depth = output
+                    .lnpbp4_min_tree_depth()?
+                    .unwrap_or(ANCHOR_MIN_LNPBP4_DEPTH);
+                let multi_source = lnpbp4::MultiSource {
+                    min_depth,
+                    messages,
+                };
+                Ok(lnpbp4::MerkleTree::try_commit_static(&multi_source)?)
+            };
+
+        let (dbc_proof, lnpbp4_proof) = if let Some(output) =
+            self.outputs.iter_mut().find(|o| o.is_tapret_host())
+        {
+            let tree = lnpbp4_tree(output)?;
+            let commitment = tree.consensus_commit();
+            let proof = output.embed_commit(&commitment)?;
+            output.set_tapret_commitment(commitment.into_array(), &proof)?;
+            output.set_lnpbp4_entropy(1)?;
+            (Proof::TapretFirst(proof), tree)
+        } else if let Some(output) =
+            self.outputs.iter_mut().find(|o| o.is_opret_host())
+        {
+            let tree = lnpbp4_tree(output)?;
+            let commitment = tree.consensus_commit();
+            output.script = Script::new_op_return(commitment.as_slice()).into();
+            output.set_opret_commitment(commitment.into_array())?;
+            output.set_lnpbp4_entropy(1)?;
             (Proof::OpretFirst, tree)
         } else {
             return Err(PsbtCommitError::CommitmentImpossible);
